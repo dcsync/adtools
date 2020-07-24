@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+
+import sys
+import os
+import re
+import argparse
+import collections
+import copy
+
+import utils
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-u', '--user', action='append', help='Filter by user')
+    parser.add_argument('--user-file', help='Filter by users from file')
+    parser.add_argument('-c', '--computer', action='append', help='Filter by computer')
+    parser.add_argument('--computer-file', help='Filter by computers from file')
+    parser.add_argument('-C', '--by-computer', action='store_true', help='Sort by computer instead of by user')
+    parser.add_argument('file', help='File to parse')
+    args = parser.parse_args()
+
+    # --user
+    users = []
+    if args.user:
+        users += [user.lower() for user in args.user]
+
+    # --user-file
+    if args.user_file:
+        with open(args.user_file, 'r') as fp:
+            users += [user.strip().lower() for user in fp]
+
+    # --computer
+    computers = []
+    if args.computer:
+        computers += [computer.lower() for computer in args.computer]
+
+    # --computer-file
+    if args.computer_file:
+        with open(args.computer_file, 'r') as fp:
+            computers += [computer.strip().lower() for computer in fp]
+
+    # read in file
+    with open(args.file, 'r') as fp:
+        items = []
+        item = {}
+        for line in fp:
+            line = line.strip()
+
+            if not line:
+                # reset
+                if item:
+                    items.append(item)
+                item = {}
+            else:
+                # add field to item
+                parts = line.split(':')
+                key = parts[0].strip().lower()
+                value = parts[1].strip()
+                item[key] = value
+
+        if item:
+            items.append(item)
+        
+        # de-duplicate
+        new_items = []
+        for item in items:
+            new_item = copy.copy(item)
+            new_item['sessions'] = items.count(item)
+            if new_item not in new_items:
+                new_items.append(new_item)
+        items = new_items
+
+        # filter items
+        new_items = []
+        for item in items:
+            if users:
+                if item['username'].lower() not in users:
+                    continue
+
+            if computers:
+                if item['computername'].split('.')[0].lower() not in computers:
+                    continue
+
+            new_items.append(item)
+        items = new_items
+
+        # sort items
+        grouped_items = collections.defaultdict(list)
+        # --by-computer
+        if args.by_computer:
+            for item in items:
+                grouped_items[item['computername']].append(item)
+        else:
+            for item in items:
+                grouped_items[item['username']].append(item)
+
+        # print it
+        for group, items in grouped_items.items():
+            print('--- {} ---'.format(group))
+
+            for item in items:
+                if 'userdomain' in item:
+                    user = r'{}\{}'.format(item['userdomain'], item['username'])
+                else:
+                    user = item['username']
+
+                out = r'{} sessions of {}@{}'.format(item['sessions'], user, item['computername'])
+
+                if 'ipaddress' in item and item['computername'] != item['ipaddress']:
+                    out += ' (IP {})'.format(item['ipaddress'])
+
+                if item['localadmin'] == 'True':
+                    out += ' (admin)'
+
+                print(out)
+
+            print()
+
+if __name__ == '__main__':
+    main()

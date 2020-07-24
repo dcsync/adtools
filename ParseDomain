@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+
+import sys
+import os
+import re
+import argparse
+
+import utils
+
+# objectclass aliases (see convert_objectclass_aliases)
+class_aliases = {'gpo': 'groupPolicyContainer',
+                 'ou': 'organizationalUnit',
+                 'scp': 'serviceConnectionPoint',
+                 'td': 'trustedDomain',
+                 'u': 'user',
+                 'g': 'group',
+                 'c': 'computer'}
+
+# samaccounttype aliases (see convert_samaccounttype_aliases)
+type_aliases = {'computer': 'MACHINE_ACCOUNT',
+                'machine': 'MACHINE_ACCOUNT',
+                'group': 'GROUP_OBJECT',
+                'user': 'USER_OBJECT',
+                'alias': 'ALIAS_OBJECT'}
+
+def convert_objectclass_aliases(object_class):
+    """
+    Convert short-form objectclass names to their full versions
+
+    :param object_class: Short-form object class
+    :return: Full-form object class
+    """
+
+    if object_class.lower() in class_aliases:
+        return class_aliases[object_class.lower()]
+    else:
+        return object_class
+
+def convert_samaccounttype_aliases(account_type):
+    """
+    Convert short-form samaccounttype names to their full versions
+
+    :param account_type: Short or long form samaccounttype
+    :return: Full-form object class
+    :raises RuntimeError: If the alias or account type isn't recognized
+    """
+
+    # check aliases
+    if account_type.lower() in type_aliases:
+        return type_aliases[account_type.lower()]
+
+    account_type = account_type.upper()
+
+    if account_type in ('USER_OBJECT', 'GROUP_OBJECT', 'MACHINE_ACCOUNT', 'ALIAS_OBJECT'):
+        return account_type
+    else:
+        raise RuntimeError('Unrecognized samaccounttype: {}'.format(account_type))
+
+def check_samaccounttype(item, account_type):
+    """
+    Check an object's samaccounttype
+
+    :param account_type: Short or long form samaccounttype
+    :return: True if the account type matches
+    :raises RuntimeError: If the alias or account type isn't recognized
+    """
+
+    account_type = convert_samaccounttype_aliases(account_type)
+    return 'samaccounttype' in item and item['samaccounttype'] == account_type
+
+def parse_enumeration(enumeration, allow_incomplete=True):
+    """
+    Parse a PowerShell enumeration in the '{item1, item2}' format.
+
+    :param enumeration: Enumeration to parse.
+    :param allow_incomplete: Allow incomplete enumerations
+    :return: Items in the enumeration
+    """
+
+    enumeration = enumeration.strip()
+
+    match = re.match('{(.*)}', enumeration)
+    if match:
+        items = match.group(1)
+        items = [item.strip() for item in items.split(', ')]
+
+        # deal with ...
+        if items[-1].endswith('...'):
+            if allow_incomplete:
+                items[-1] = items[-1][:-3]
+            else:
+                raise RuntimeError('Incomplete enumeration: {}'.format(enumeration))
+
+        return items
+    else:
+        # single item
+        return [enumeration]
+
+def find_item(dn, items):
+    """
+    Find an item based on its distinguishedname field
+
+    :param dn: DN to search for
+    :param items: Items to search in
+    :return: Found item or None
+    """
+
+    for item in items:
+        if 'distinguishedname' not in item:
+            continue
+
+        if item['distinguishedname'].strip().lower() == dn.strip().lower():
+            return item
+
+    return None
+
+indent = 4
+def print_group_tree(root, items, level=0):
+    """
+    Print a tree by linking member fields with their items recursively
+
+    :param root: Item to start at
+    :param items: Items to base tree on
+    :param level: Current level for indentation
+    """
+
+    print(' ' * (level * indent) + root['name'])
+    if 'member' in root:
+        members = parse_enumeration(root['member'])
+        for member in members:
+            found = find_item(member, items)
+            if found:
+                if found['distinguishedname'] == root['distinguishedname']:
+                    continue
+
+                print_group_tree(found, items, level=level + 1)
+            else:
+                print(' ' * ((level + 1) * indent) + 'missing item: ' + member)
+
+def parse_powerview(data):
+    items = []
+    item = {}
+    last_key = None
+
+    for line in data.splitlines():
+        if not line.strip():
+            # next object
+            if item:
+                items.append(item)
+            item = {}
+            last_key = None
+        elif ':' in line and line[0] != ' ':
+            # add field to item
+            parts = line.split(':')
+            key = parts[0].strip().lower()
+            value = ':'.join(parts[1:]).strip()
+            item[key] = value
+            last_key = key
+        elif last_key:
+            item[last_key] += line.strip()
+
+    if item:
+        items.append(item)
+
+def main():
+    type_alias_info = ', '.join(['{}={}'.format(short, full) for short, full in type_aliases.items()])
+    object_alias_info = ', '.join(['{}={}'.format(short, full) for short, full in class_aliases.items()])
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-n', '--not', action='store_true', dest='not_', help='Invert the filters')
+    parser.add_argument('-p', '--property', action='append', help='Select property')
+    parser.add_argument('-s', '--sort', help='Sort by field')
+    parser.add_argument('-t', '--type', action='append', help='Select objects by samaccounttype. Case-insensitive and accepts aliases '.format(type_alias_info))
+    parser.add_argument('-c', '--object-class', action='append', help='Select objects of class. May be case-insensitive AD class names or aliases {}'.format(object_alias_info))
+    parser.add_argument('--parent-class', action='append', help='Select objects in class, including parent classes. May be case-insensitive AD class names or aliases (see --object-class)')
+    parser.add_argument('-f', '--filter', action='append', help='Filter by property (property=value)')
+    parser.add_argument('-F', '--filter-file', help='Filter by properties in file (property=value)')
+    parser.add_argument('-r', '--regex', action='append', help='Filter by property (property=regex)')
+    parser.add_argument('-H', '--no-headers', action='store_true', help="Don't show headers")
+    parser.add_argument('--emails', action='store_true', help="Produce a list of emails (for Get-DomainUser)")
+    parser.add_argument('--tree', action='store_true', help="Produce a tree (for Get-DomainGroup)")
+    parser.add_argument('--admins', action='store_true', help="Only show admins (admincount=1)")
+    parser.add_argument('--laps', action='store_true', help="Show computers with LAPS enabled")
+    parser.add_argument('files', nargs='+', help='Files to parse')
+    args = parser.parse_args()
+
+    # read in files
+    for file_ in args.files:
+        with open(file_, 'r') as fp:
+            data = fp.read()
+            items = parse_powerview(data)
+
+            #contents = fp.read().decode('utf-16').encode('utf-8').decode()
+            #lines = contents.decode().splitlines()
+
+    # -f/--filter
+    filters = []
+    if args.filter:
+        filters += args.filter
+
+    # -F/--filter-file
+    if args.filter_file:
+        with open(args.filter_file, 'r') as fp:
+            filters += list(fp.readlines())
+
+    # quick filters
+    # --admins
+    if args.admins:
+        filters.append('admincount=1')
+
+    # --laps
+    if args.laps:
+        filters.append('ms-mcs-admpwdexpirationtime=*')
+
+    # -t/--type
+    if args.type:
+        for account_type in args.type:
+            account_type = convert_samaccounttype_aliases(account_type)
+            filters.append('samaccounttype={}'.format(account_type))
+
+    # filter items
+    filtered_items = []
+    for item in items:
+        filtered_item = filters or args.regex or \
+                        args.object_class or args.parent_class
+
+        # check filters
+        for filt in filters:
+            if '=' not in filt:
+                raise RuntimeError('Bad filter: ' + filt)
+            
+            key, *value_parts = filt.split('=')
+            value = '='.join(value_parts)
+            key = key.strip().lower()
+            value = value.strip().lower()
+
+            if not key or key == '*':
+                # all keys
+                keys = item.keys()
+            else:
+                # one key
+                if key not in item:
+                    continue
+                keys = [key]
+
+            for key in keys:
+                if not value or value == '*' or item[key].lower() == value:
+                    filtered_item = False
+                    break
+
+        # -r/--regex
+        if args.regex:
+            for filt in args.regex:
+                if '=' not in filt:
+                    raise RuntimeError('bad filter: ' + filt)
+                
+                key, *value_parts = filt.split('=')
+                value = '='.join(value_parts)
+                key = key.strip().lower()
+                value = value.strip().lower()
+
+                if not key or key == '*':
+                    # all keys
+                    keys = item.keys()
+                else:
+                    # one key
+                    if key not in item:
+                        continue
+                    keys = [key]
+
+                for key in keys:
+                    match = re.match(value, item[key], re.IGNORECASE)
+                    if match:
+                        filtered_item = False
+                        break
+
+        if (args.object_class or args.parent_class) and 'objectclass' in item:
+            object_classes = parse_enumeration(item['objectclass'])
+            in_class = False
+
+            # -c/--object-class
+            if args.object_class and object_classes:
+                for object_class in args.object_class:
+                    object_class = convert_objectclass_aliases(object_class)
+                    if object_class.lower() == object_classes[-1].lower():
+                        in_class = True
+                        break
+
+            # --parent-class
+            if args.parent_class:
+                for object_class in args.parent_class:
+                    object_class = convert_objectclass_aliases(object_class)
+                    if object_class.lower() in [object_class.lower() for object_class in object_classes]:
+                        in_class = True
+                        break
+
+            if in_class:
+                filtered_item = False
+
+        # --not
+        if args.not_:
+            filtered_item = not filtered_item
+
+        if not filtered_item:
+            filtered_items.append(item)
+
+    # -s/--sort
+    if args.sort:
+        all_int = True
+        for item in filtered_items:
+            if args.sort in item:
+                if not utils.is_int(item[args.sort]):
+                    all_int = False
+
+        def sort_helper(item):
+            if args.sort in item:
+                value = item[args.sort]
+
+                if all_int:
+                    return int(value)
+                else:
+                    return value
+            else:
+                if all_int:
+                    return -999999999
+                else:
+                    return ''
+
+        filtered_items = sorted(filtered_items, key=sort_helper, reverse=True)
+
+    # --tree
+    if args.tree:
+        # print tree view
+        for item in filtered_items:
+            if 'objectclass' not in item:
+                continue
+
+            if 'group' not in parse_enumeration(item['objectclass']):
+                continue
+
+            if 'memberof' not in item:
+                # root item
+                print_group_tree(item, filtered_items)
+    # --emails
+    elif args.emails:
+        # print email view
+        for item in filtered_items:
+            if not check_samaccounttype(item, 'user'):
+                continue
+
+            if 'mail' not in item:
+                continue
+
+            if 'name' in item:
+                name = item['name']
+            else:
+                name = item['mail']
+
+            print('{} <{}>'.format(name, item['mail']))
+    else:
+        for item in filtered_items:
+            # print default property view
+            # -p/--property
+            if args.property:
+                properties = []
+                for prop in args.property:
+                    properties += prop.split(',')
+
+                if properties & item.keys() == set():
+                    # skip objects without any properties we care about
+                    continue
+            else:
+                properties = item.keys()
+
+            # -H/--no-headers
+            if not args.no_headers:
+                if 'samaccounttype' in item:
+                    if check_samaccounttype(item, 'user'):
+                        print('User:')
+                    elif check_samaccounttype(item, 'group'):
+                        print('Group:')
+                    elif check_samaccounttype(item, 'computer'):
+                        print('Computer:')
+                    elif check_samaccounttype(item, 'alias'):
+                        print('Alias:')
+                    else:
+                        print('Object:')
+                else:
+                    print('Object:')
+
+            # print fields
+            for prop in sorted(properties):
+                if prop in item:
+                    if prop == 'usercertificate':
+                        # don't print this one
+                        value = '<bytes>'
+                    else:
+                        value = item[prop]
+
+                    if args.no_headers:
+                        print('{}'.format(value))
+                    else:
+                        print('  - {}: {}'.format(prop, value))
+
+            if not args.no_headers:
+                print('')
+
+if __name__ == '__main__':
+    main()

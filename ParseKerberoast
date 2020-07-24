@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+
+import sys
+import os
+import re
+import argparse
+
+import utils
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('file', help='File to parse')
+    args = parser.parse_args()
+
+    # read in file
+    with open(args.file, 'r') as fp:
+        item = None
+        value = ''
+
+        for line in fp:
+            # look for new item
+            m = re.match('^(?:\[.\] )?([a-z]+)\s* : (.*)', line, re.IGNORECASE)
+            if m:
+                if item == 'Hash':
+                    # print last item if it's a Hash
+                    print(value)
+
+                item = m.group(1)
+                value = m.group(2)
+            else:
+                # it's part of the value
+                value += line.strip()
+
+        if item == 'Hash':
+            # print last item if it's a Hash
+            print(value)
+
+if __name__ == '__main__':
+    main()
