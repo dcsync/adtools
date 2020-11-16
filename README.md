@@ -1,5 +1,34 @@
-Tools for parsing and filtering
-[PowerView](https://github.com/PowerShellMafia/PowerSploit/tree/dev) output.
+DumpLDAP
+========
+
+DumpLDAP dumps an LDAP server to json. This allows for offline exploration and better network opsec. Usage:
+
+    usage: DumpLDAP [-h] -u USER -p PASSWORD [--simple-auth] [-q QUERY] [-b BASE]
+                    [--page-size PAGE_SIZE] [--page-throttle PAGE_THROTTLE]
+                    [--no-pagination] [-o OUTPUT]
+                    host
+    
+    auth:
+      -u USER, --user USER  Auth username (DOMAIN\user)
+      -p PASSWORD, --password PASSWORD
+                            Auth password or LM:NTLM hash
+      --simple-auth         Use SIMPLE auth instead of NTLM
+    
+    ldap:
+      host                  LDAP server
+      -q QUERY, --query QUERY
+                            LDAP query (default: dump everything with
+                            (&(objectclass=*)))
+      -b BASE, --base BASE  LDAP base (default: AD root)
+      --page-size PAGE_SIZE
+                            LDAP request page size (default: 100)
+      --page-throttle PAGE_THROTTLE
+                            Delay between LDAP page requests (default: 0.0)
+      --no-pagination       Do not use LDAP pagination
+    
+    output:
+      -o OUTPUT, --output OUTPUT
+                            Output file (default: stdout)
 
 ParseDomain
 ===========
