@@ -88,39 +88,58 @@ Replace `Get-DomainObject` with more selective functions if desired.
 
 For more options:
 
-    $ ./ParseDomain -h
-    usage: ParseDomain [-h] [-p PROPERTY] [-s SORT] [-c OBJECT_CLASS]
-                       [--parent-class PARENT_CLASS] [-f FILTER] [-F FILTER_FILE]
-                       [-r REGEX] [-H] [--emails] [--tree] [--admins]
+    usage: ParseDomain [-h] [--no-generator] [-f FILTER] [-F FILTER_FILE]
+                       [-r REGEX] [-P PYTHON_FILTER] [-n] [-a] [-c CATEGORY]
+                       [-q {laps,admin,dc,da,server}] [-p PROPERTY] [-s SORT]
+                       [--pretty-print] [--no-keys] [--show-binary] [-D]
+                       [--emails] [--tree] [--count] [--wordlist]
                        files [files ...]
-    
-    positional arguments:
-      files                 Files to parse
     
     optional arguments:
       -h, --help            show this help message and exit
-      -p PROPERTY, --property PROPERTY
-                            Select property
-      -s SORT, --sort SORT  Sort by field
-      -c OBJECT_CLASS, --object-class OBJECT_CLASS
-                            Select objects of class. May be case-insensitive AD
-                            class names or aliases gpo=groupPolicyContainer,
-                            ou=organizationalUnit, scp=serviceConnectionPoint,
-                            td=trustedDomain, u=user, g=group, c=computer
-      --parent-class PARENT_CLASS
-                            Select objects in class, including parent classes. May
-                            be case-insensitive AD class names or aliases (see
-                            --object-class)
+    
+    parsing:
+      --no-generator        Do not use generator-producing lazy-loading JSON
+                            performance hack that works most of the time but not
+                            always
+    
+    filters:
       -f FILTER, --filter FILTER
                             Filter by property (property=value)
       -F FILTER_FILE, --filter-file FILTER_FILE
                             Filter by properties in file (property=value)
       -r REGEX, --regex REGEX
                             Filter by property (property=regex)
-      -H, --no-headers      Don't show headers
-      --emails              Produce a list of emails (for Get-DomainUser)
-      --tree                Produce a tree (for Get-DomainGroup)
-      --admins              Only show admins (admincount=1)
+      -P PYTHON_FILTER, --python-filter PYTHON_FILTER
+                            Filter with an evaled Python boolean expression. Each
+                            run exposes "item" which is {key: value, ...}
+      -n, --not             Invert the filters
+      -a, --and             Treat filters as an "and" instead of an "or". Narrow
+                            search down for search filter applied.
+      -c CATEGORY, --category CATEGORY
+                            Filter objects by x-baseCategory. Aliases: {'gpo':
+                            'Group-Policy-Container', 'ou': 'Organizational-Unit',
+                            'scp': 'Service-Connection-Point', 'td': 'Trusted-
+                            Domain', 'p': 'Person', 'g': 'Group', 'c': 'Computer'}
+      -q {laps,admin,dc,da,server}, --quick-filter {laps,admin,dc,da,server}
+                            Add a quick filter. Options: laps, admin, dc, da,
+                            server
+    
+    regular output:
+      -p PROPERTY, --property PROPERTY
+                            Select property to show
+      -s SORT, --sort SORT  Sort by field
+      --pretty-print        Show pretty human-readable headers
+      --no-keys             Do not show parameter keys
+      --show-binary         Show binary blobs in their encoded formats
+      -D, --debug           Enable debug output
+    
+    special output:
+      --emails              Produce a list of user emails
+      --tree                Produce a user-group tree (for Get-DomainGroup)
+      --count               Produce tally of items
+      --wordlist            Produce a wordlist from field values
+      files                 Files to parse
 
 ParseUserHunter
 ===============
