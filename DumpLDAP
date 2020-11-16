@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+
+import sys
+import os
+import re
+import argparse
+import ldap3
+import pprint
+import asyncio
+import json
+
+import utils
+
+default_page_size = 100
+default_page_throttle = 0.0
+default_query = '(&(objectclass=*))'
+
+#27  from ...utils.dn import safe_dn
+#  1 from ...core.results import DO_NOT_RAISE_EXCEPTIONS, RESULT_SIZE_LIMIT_EXCEEDED
+#  2 from ...core.exceptions import LDAPOperationResult
+#  3 from ...utils.log import log, log_enabled, ERROR, BASIC, PROTOCOL, NETWORK, EXTENDED
+
+# copied straight from ldap3 and fixed
+def paged_search_generator(connection,
+                           search_base,
+                           search_filter,
+                           search_scope=ldap3.SUBTREE,
+                           dereference_aliases=ldap3.DEREF_ALWAYS,
+                           attributes=None,
+                           size_limit=0,
+                           time_limit=0,
+                           types_only=False,
+                           get_operational_attributes=False,
+                           controls=None,
+                           paged_size=100,
+                           paged_criticality=False):
+    if connection.check_names and search_base:
+        search_base = ldap3.utils.dn.safe_dn(search_base)
+
+    responses = []
+    original_connection = None
+    original_auto_referrals = connection.auto_referrals
+    connection.auto_referrals = False  # disable auto referrals because it cannot handle paged searches
+    cookie = True  # performs search operation at least one time
+    cachekey = None  # for referrals cache
+    while cookie:
+        result = connection.search(search_base,
+                                   search_filter,
+                                   search_scope,
+                                   dereference_aliases,
+                                   attributes,
+                                   size_limit,
+                                   time_limit,
+                                   types_only,
+                                   get_operational_attributes,
+                                   controls,
+                                   paged_size,
+                                   paged_criticality,
+                                   None if cookie is True else cookie)
+
+        if not isinstance(result, bool):
+            response, result = connection.get_response(result)
+        else:
+            response = connection.response
+            result = connection.result
+
+        if result['referrals'] and original_auto_referrals:  # if rererrals are returned start over the loop with a new connection to the referral
+            if not original_connection:
+                original_connection = connection
+            _, connection, cachekey = connection.strategy.create_referral_connection(result['referrals'])   # change connection to a valid referrals
+            continue
+
+        responses.extend(response)
+        try:
+            cookie = result['controls']['1.2.840.113556.1.4.319']['value']['cookie']
+        except KeyError:
+            cookie = None
+
+        if connection.raise_exceptions and result and result['result'] not in ldap3.core.results.DO_NOT_RAISE_EXCEPTIONS:
+            if ldap3.utils.log.log_enabled(ldap3.utils.log.PROTOCOL):
+                ldap3.utils.log.log(ldap3.utils.log.PROTOCOL, 'paged search operation result <%s> for <%s>', result, connection)
+
+            # FIXED:
+            #if result['result'] == RESULT_SIZE_LIMIT_EXCEEDED:
+            #    while responses:
+            #        yield responses.pop()
+            yield from connection.entries
+
+            raise LDAPOperationResult(result=result['result'], description=result['description'], dn=result['dn'], message=result['message'], response_type=result['type'])
+
+        # FIXED:
+        #while responses:
+        #    yield responses.pop()
+        yield from connection.entries
+
+    if original_connection:
+        connection = original_connection
+        if connection.use_referral_cache and cachekey:
+            connection.strategy.referral_cache[cachekey] = connection
+        else:
+            connection.unbind()
+
+    connection.auto_referrals = original_auto_referrals
+    connection.response = None
+
+async def dumpEntries(out, entries):
+    """
+    Dump entries from an LDAP query to a file as JSON
+
+    :param out: Output file (or None if stdout)
+    :param entries: Entries to dump
+    """
+
+    # choose output
+    if out:
+        outfp = open(out, 'w+') if out else None
+    else:
+        outfp = sys.stdout
+
+    outfp.write('[\n')
+    async for entry in entries:
+        # dictionary: entry_attributes_as_dict
+        outfp.write(entry.entry_to_json() + ',\n')
+    outfp.write(']\n')
+
+async def makeQuery(connection, base, query,
+        pagination=True, page_throttle=default_page_throttle,
+        page_size=default_page_size):
+    """
+    Make an LDAP query
+
+    :param connection: LDAP connection
+    :param base: LDAP base
+    :param query: Query to make
+    :pagination: Use LDAP pagination?
+    :page_throttle: Sleep between page requests
+    :page_size: Pagination request size
+    """
+
+    """
+    if raw_entry['type'] == 'searchResRef':
+        utils.info('reference: {}'.format(raw_entry['uri'][0]))
+    else:
+        entries = connection._get_entries([raw_entry])
+        if len(entries) > 0:
+            entry = entries[0]
+        else:
+            continue
+
+    """
+
+    if pagination:
+        for number, entry in enumerate(paged_search_generator(connection, base, query, paged_size=page_size, attributes=ldap3.ALL_ATTRIBUTES)):
+            yield entry
+            if page_throttle != 0.0 and number % (page_size - 1) == 0 and number != 0:
+                # page request throttle
+                await asyncio.sleep(page_throttle)
+    else:
+        connection.search(base, query, attributes=ldap3.ALL_ATTRIBUTES)
+        for entry in connection.response:
+            yield entry
+
+def connect(host, user, password, simple_auth=False):
+    """
+    Connect to an LDAP server
+
+    :param host: Server host
+    :param user: Auth username
+    :param password: Auth password
+    :param simple_auth: User SIMPLE auth instead of NTLM auth
+    """
+
+    # fix / in username
+    if '/' in user:
+        user = user.replace('/', '\\')
+
+    server = ldap3.Server(host, get_info=ldap3.ALL) 
+    utils.info('connecting to server')
+    utils.subline('- host: {}'.format(host))
+
+    authentication = 'SIMPLE' if simple_auth else 'NTLM' 
+    connection = ldap3.Connection(server, user=user, password=password, authentication=authentication)
+
+    utils.info('authenticating')
+    utils.subline('- user: {}'.format(user))
+    utils.subline('- password: {}'.format(password))
+    utils.subline('- auth type: {}'.format(authentication))
+    if not connection.bind():
+        utils.die('failed to authenticate as {}'.format(user))
+
+    return server, connection
+
+def main():
+    parser = argparse.ArgumentParser()
+    group = parser.add_argument_group('auth')
+    group.add_argument('-u', '--user', required=True,
+            help='Auth username (DOMAIN\\user)')
+    group.add_argument('-p', '--password', required=True,
+            help='Auth password or LM:NTLM hash')
+    group.add_argument('--simple-auth', action='store_true',
+            help='Use SIMPLE auth instead of NTLM')
+    group = parser.add_argument_group('ldap')
+    group.add_argument('host', help='LDAP server')
+    group.add_argument('-q', '--query', default=default_query,
+            help='LDAP query (default: dump everything with {})'.format(default_query))
+    group.add_argument('-b', '--base',
+            help='LDAP base (default: AD root)'.format(default_query))
+    group.add_argument('--page-size', type=int, default=default_page_size,
+            help='LDAP request page size (default: {})'.format(default_page_size))
+    group.add_argument('--page-throttle', type=float, default=default_page_throttle,
+            help='Delay between LDAP page requests (default: {})'.format(default_page_throttle))
+    group.add_argument('--no-pagination', action='store_true',
+            help='Do not use LDAP pagination')
+    group = parser.add_argument_group('output')
+    group.add_argument('-o', '--output',
+            help='Output file (default: stdout)')
+    args = parser.parse_args()
+
+    # check user
+    if not ('\\' in args.user or '/' in args.user):
+        utils.die('User must be in the format DOMAIN\\user')
+
+    server, connection = connect(args.host, args.user, args.password, simple_auth=args.simple_auth)
+
+    # choose base
+    if args.base:
+        base = args.base
+    else:
+        base = server.info.other['defaultNamingContext'][0]
+
+    # get server info
+    service_name = server.info.other['ldapServiceName'][0]
+    dns_name = server.info.other['dnsHostName']
+    synchronized = 'yes' if server.info.other['isSynchronized'][0] == 'TRUE' else 'no'
+    utils.info('server info:')
+    utils.subline('- service name: {}'.format(service_name))
+    utils.subline('- dns name: {}'.format(dns_name))
+    utils.subline('- synchronized: {}'.format(synchronized))
+
+    # show query
+    utils.good('starting ldap dump')
+    utils.subline('- query: {}'.format(args.query))
+    utils.subline('- base: {}'.format(base))
+
+    # make query
+    entries = makeQuery(connection, base, args.query, pagination=not args.no_pagination,
+            page_throttle=args.page_throttle, page_size=args.page_size)
+    loop = asyncio.get_event_loop()
+    result = loop.run_until_complete(dumpEntries(args.output, entries))
+
+if __name__ == '__main__':
+    main()
