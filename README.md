@@ -4,9 +4,9 @@ Tools for parsing and filtering
 ParseDomain
 ===========
 
-ParseDomain can parse and filter the text outputs of `Get-DomainUser`,
-`Get-DomainComputer`, `Get-DomainGroup`, `Get-DomainObject`, etc. Some
-examples:
+ParseDomain parse and filters AD dumps. It can digest output from DumpDomain,
+ldapdomaindump, and PowerView's with `Get-Domain*` functions ( e.g.
+`Get-DomainComputer`, `Get-DomainObject`). Some examples:
 
 Searching for Windows 7 machines:
 
@@ -50,6 +50,12 @@ ParseDomain can make a user-group tree:
         Cert Publishers
             CORPDC
     ...
+
+We recommend the following PowerShell example to properly dump a domain with PowerView.
+Replace `Get-DomainObject` with more selective functions if desired.
+
+	$FormatEnumerationLimit=-1
+	Get-DomainObject | Format-List -Property * > objects.domain
 
 For more options:
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Parse Invoke-Kerberoast output.
 
 import sys
 import os

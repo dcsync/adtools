@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Parse PowerView's UserHunter output.
 
 import sys
 import os

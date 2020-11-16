@@ -1,13 +1,61 @@
 #!/usr/bin/env python3
+# TODO
+# [.] search for unusual user fields (implemented in PowerView as Find-...Outlier
+# [.] wordlist generator
+# [ ] view: show ACL relationships
+# [ ] view: show GPO/GPP objects
+# [ ] view: show SPNs
+# [x] quick filter for DCs
+# [ ] quick filters from goddi
+# [ ] filter shortcut for "in a group"
+# [ ] filter shortcut for "in an OU"
+# [ ] OU trees
+# [ ] json output
+# [ ] quick filters from https://social.technet.microsoft.com/wiki/contents/articles/5392.active-directory-ldap-syntax-filters.aspx?Sort=MostRecent
+# [ ] parse DNs
+
+"""
+notes for converting to bloodhound
+
+user json format:
+{
+    users: [
+        {
+            Properties: {'domain', 'objectsid', 'highvalue', 'enabled',
+                         'lastlogon', 'pwdlastset', 'serviceprincipalnames', 'hasspn',
+                         'displayname', 'email', 'title', 'homedirectory', 'description',
+                         'userpassword', 'sensitive', 'dontreqpreauth', 'admincount'}
+            Name: name@domain.fqdn
+            PrimaryGroup: group@domain.fqdn
+            Aces: [{'PrincipalName', 'PrincipalType', 'RightName', 'AceType'}]
+            AllowedToDelegate: []
+        }
+    ]
+    meta: {
+       count: <int>
+       type: users, groups, ...
+    }
+}
+"""
 
 import sys
 import os
 import re
 import argparse
+import json
+import collections
 
 import utils
 
-# objectclass aliases (see convert_objectclass_aliases)
+# output settings
+tree_indent = 4
+
+# wordlist settings
+wordlist_minimum_word_length = 3
+wordlist_maximum_word_length = 10
+wordlist_splits = (None, '/', '=', '.', ',', ';', ':', '-', '@', '#', '$', '&', '\\', '+')
+
+# category and objectclass aliases
 class_aliases = {'gpo': 'groupPolicyContainer',
                  'ou': 'organizationalUnit',
                  'scp': 'serviceConnectionPoint',
@@ -15,60 +63,91 @@ class_aliases = {'gpo': 'groupPolicyContainer',
                  'u': 'user',
                  'g': 'group',
                  'c': 'computer'}
+category_aliases = {'gpo': 'Group-Policy-Container',
+                    'ou': 'Organizational-Unit',
+                    'scp': 'Service-Connection-Point',
+                    'td': 'Trusted-Domain',
+                    'p': 'Person',
+                    'g': 'Group',
+                    'c': 'Computer'}
 
-# samaccounttype aliases (see convert_samaccounttype_aliases)
-type_aliases = {'computer': 'MACHINE_ACCOUNT',
-                'machine': 'MACHINE_ACCOUNT',
-                'group': 'GROUP_OBJECT',
-                'user': 'USER_OBJECT',
-                'alias': 'ALIAS_OBJECT'}
+property_aliases = {'dn': 'distinguishedName',
+                    'spn': 'servicePrincipalName'}
 
-def convert_objectclass_aliases(object_class):
+quick_filters = {'laps': '"ms-mcs-admpwdexpirationtime" in item',
+                 'admin': 'item["admincount"] == 1',
+                 'dc': 'item["x-baseCategory"] == "Computer" and "OU=Domain Controllers" in item["distinguishedname"]',
+                 'da': '"CN=Domain Admins," in "".join(item["memberOf"])',
+                 'server': 'item["x-baseCategory"] == "Computer" and "Server" in item["operatingSystem"]',
+                }
+
+boring_user_fields = (
+    'accountExpires'
+    'adminCount'
+    'badPasswordTime'
+    'badPwdCount'
+    'cn'
+    'codePage'
+    'company'
+    'countryCode'
+    'dSCorePropagationData'
+    'description'
+    'distinguishedName'
+    'instanceType'
+    'isCriticalSystemObject'
+    'lastLogoff'
+    'lastLogon'
+    'logonCount'
+    'memberOf'
+    'msDS-SupportedEncryptionTypes'
+    'name'
+    'objectCategory'
+    'objectClass'
+    'objectGUID'
+    'objectSid'
+    'primaryGroupID'
+    'pwdLastSet'
+    'sAMAccountName'
+    'sAMAccountType'
+    'servicePrincipalName'
+    'uSNChanged'
+    'uSNCreated'
+    'userAccountControl'
+    'whenChanged'
+    'whenCreated'
+)
+
+def convert_class_aliases(class_):
     """
     Convert short-form objectclass names to their full versions
 
-    :param object_class: Short-form object class
+    :param class_: Possibly short-form object class
     :return: Full-form object class
     """
 
-    if object_class.lower() in class_aliases:
-        return class_aliases[object_class.lower()]
+    global class_aliases
+
+    if class_.lower() in class_aliases:
+        return class_aliases[class_.lower()]
     else:
-        return object_class
+        return class_
 
-def convert_samaccounttype_aliases(account_type):
+def convert_category_aliases(category):
     """
-    Convert short-form samaccounttype names to their full versions
+    Convert short-form objectCategory and x-baseCategory names to their full versions
 
-    :param account_type: Short or long form samaccounttype
-    :return: Full-form object class
-    :raises RuntimeError: If the alias or account type isn't recognized
+    :param category: Possibly short-form object category
+    :return: Full-form object category
     """
 
-    # check aliases
-    if account_type.lower() in type_aliases:
-        return type_aliases[account_type.lower()]
+    global category_aliases
 
-    account_type = account_type.upper()
-
-    if account_type in ('USER_OBJECT', 'GROUP_OBJECT', 'MACHINE_ACCOUNT', 'ALIAS_OBJECT'):
-        return account_type
+    if category.lower() in category_aliases:
+        return category_aliases[category.lower()]
     else:
-        raise RuntimeError('Unrecognized samaccounttype: {}'.format(account_type))
+        return category
 
-def check_samaccounttype(item, account_type):
-    """
-    Check an object's samaccounttype
-
-    :param account_type: Short or long form samaccounttype
-    :return: True if the account type matches
-    :raises RuntimeError: If the alias or account type isn't recognized
-    """
-
-    account_type = convert_samaccounttype_aliases(account_type)
-    return 'samaccounttype' in item and item['samaccounttype'] == account_type
-
-def parse_enumeration(enumeration, allow_incomplete=True):
+def parse_powershell_enumeration(enumeration, allow_incomplete=True):
     """
     Parse a PowerShell enumeration in the '{item1, item2}' format.
 
@@ -114,7 +193,6 @@ def find_item(dn, items):
 
     return None
 
-indent = 4
 def print_group_tree(root, items, level=0):
     """
     Print a tree by linking member fields with their items recursively
@@ -124,29 +202,61 @@ def print_group_tree(root, items, level=0):
     :param level: Current level for indentation
     """
 
-    print(' ' * (level * indent) + root['name'])
+    global tree_indent
+
+    print(' ' * (level * tree_indent) + root['name'])
     if 'member' in root:
-        members = parse_enumeration(root['member'])
+        members = root['member']
+        if not isinstance(members, list):
+            # single item
+            members = [members]
         for member in members:
             found = find_item(member, items)
             if found:
-                if found['distinguishedname'] == root['distinguishedname']:
+                # avoid finding the root object
+                if found['distinguishedname'].lower() == root['distinguishedname'].lower():
                     continue
 
                 print_group_tree(found, items, level=level + 1)
             else:
-                print(' ' * ((level + 1) * indent) + 'missing item: ' + member)
+                print(' ' * ((level + 1) * tree_indent) + 'missing item: ' + member)
 
-def parse_powerview(data):
+def read_powerview(fname):
+    """
+    Parse PowerView formatted data
+
+    :param fname: File containing data in Powerview output format
+    :param generator: Produce a generator?
+    :return: Parsed data in format [{key: value,...}...]
+    """
+
+    #contents = fp.read().decode('utf-16').encode('utf-8').decode()
+    #lines = contents.decode().splitlines()
+
+    # read in file
+    with open(fname, 'r') as fp:
+        data = fp.read()
+
     items = []
     item = {}
     last_key = None
 
+    def finish_item(item):
+        # parse enumerations
+        new_item = {}
+        for key, value in item.items():
+            if value.startswith('{'):
+                value = parse_powershell_enumeration(value)
+            new_item[key] = value
+        item = new_item
+
+        if item:
+            items.append(item)
+
     for line in data.splitlines():
         if not line.strip():
             # next object
-            if item:
-                items.append(item)
+            finish_item(item)
             item = {}
             last_key = None
         elif ':' in line and line[0] != ' ':
@@ -157,157 +267,375 @@ def parse_powerview(data):
             item[key] = value
             last_key = key
         elif last_key:
+            # append to last item
             item[last_key] += line.strip()
 
-    if item:
-        items.append(item)
+    finish_item(item)
+
+    return items
+
+def read_json(fname, generator=True):
+    """
+    Parse JSON from ldap3
+
+    :param data: File containing data in JSON format
+    :param generator: Produce a generator?
+    :return: Parsed data in format [{key: value,...}...]
+    """
+
+    if generator:
+        # produce a generator
+        with open(fname, 'r') as fp:
+            try:
+                for item in utils.lazy_json_strict(fp):
+                    yield item['attributes']
+            except json.JSONDecodeError as e:
+                utils.die('Failed to read the JSON. Try --no-generator? {}'.format(e))
+    else:
+        # produce a list
+        with open(fname, 'r') as fp:
+            data = fp.read()
+        items = json.loads(data)
+        ret = []
+        for item in items:
+            ret.append(item['attributes'])
+        return ret
+
+def read_files(files, generator=True):
+    """
+    Read in files
+
+    :param files: Files to read in
+    :param generator: Produce a generator?
+    """
+
+    for file_ in files:
+        with open(file_, 'r') as fp:
+            if fp.read(1) == '[':
+                results = read_json(file_)
+            else:
+                results = read_powerview(file_)
+
+            if generator:
+                yield from results
+            else:
+                return list(results)
+
+def item_categories(item):
+    """
+    Parse objectCategory for an item into a list
+
+    :param item: LDAP item (dict)
+    :return: List of categories
+    """
+
+    categories = []
+
+    for category in item['objectCategory'].split(','):
+        category = category.split('=')[1]
+        if category == 'Schema':
+            break
+        categories.append(category)
+
+    return categories
+
+def fix_value(item, remove_binary=True):
+    """
+    Fix up a value. Recurses lists. Just removes binary values for now. Replaces
+    binary values with '<binary>'
+
+    :param itme: Item to fix.
+    :param remove_binary: Remove binary item?
+    :return: Fixed up item
+    """
+
+    if remove_binary and isinstance(item, dict) and 'encoded' in item:
+        return '<binary>'
+    elif isinstance(item, list):
+        new_item = []
+        for sub in item:
+            new_item.append(fix_value(sub, remove_binary=remove_binary))
+        return new_item
+    else:
+        return item
+
+def fix_items(items, remove_binary=True):
+    """
+    Fix up a list of LDAP items. This:
+    - flattens top-level single-item lists
+    - fixes up each value with `fix_value`
+    - adds a x-baseCategory field to the item (first category in the
+      objectCategory field)
+
+    :param items: List of LDAP items (dicts) to fix.
+    :param remove_binary: Passed to fix_value (see fix_value).
+    :return: Generator yielding fixed up new items.
+    """
+
+    for item in items:
+        new_item = utils.CaselessDictionary()
+        for key, value in item.items():
+            # flatten top level single-item lists
+            if isinstance(value, list) and len(value) == 1:
+                value = value[0]
+
+            value = fix_value(value, remove_binary=remove_binary)
+            new_item[key] = value
+
+        # add basecategory
+        categories = item_categories(new_item)
+        #new_item['x-categories'] = categories
+        new_item['x-baseCategory'] = categories[0]
+        yield new_item
+
+def run_python_filter(item, filter):
+    """
+    Run a Python filter against an LDAP item.
+
+    :param item: Item to filter
+    :param filter: Filter to run
+    :return: True if filter passes. False otherwise.
+    """
+
+    try:
+        if eval(filter):
+            return True
+    except KeyError:
+        pass
+    except Exception as e:
+        utils.die('Exception in your --python-filter {}: {}'.format(filter, e))
+        utils.debug_exception(e)
+    
+    return False
+
+def run_basic_filter(item, filter):
+    """
+    Run a basic (rudimentary) filter against an LDAP item. The format of this
+    filter is key=value, key=*, or *=value.
+
+    :param item: Item to filter
+    :param filter: Filter to run
+    :return: True if filter passes. False otherwise.
+    """
+
+    if '=' not in filter:
+        raise RuntimeError('Bad filter: ' + filter)
+
+    key, _, value = filter.partition('=')
+    key = key.strip().lower()
+    value = value.strip().lower()
+
+    if not key or key == '*':
+        # all keys
+        keys = item.keys()
+    else:
+        # one key
+        if key not in item:
+            return False
+        keys = [key]
+
+    for key in keys:
+        if not value or value == '*' or str(item[key]).lower() == value:
+            return True
+
+    return False
+
+def run_regex_filter(item, filter):
+    """
+    Run a regex filter against an LDAP item. The format of this
+    filter is key=regex or *=regex.
+
+    :param item: Item to filter
+    :param filter: Regex filter to run
+    :return: True if filter passes. False otherwise.
+    """
+
+    if '=' not in filter:
+        raise RuntimeError('bad filter: ' + filter)
+    
+    key, _, value = filter.partition('=')
+    key = key.strip().lower()
+    value = value.strip().lower()
+
+    if not key or key == '*':
+        # all keys
+        keys = item.keys()
+    else:
+        # one key
+        if key not in item:
+            return False
+        keys = [key]
+
+    for key in keys:
+        match = re.match(value, str(item[key]), re.IGNORECASE)
+        if match:
+            return True
+
+    return False
+
+def run_filters(item, filter_pairs, and_=False):
+    """
+    Run filters against an item
+
+    :param item: Item to filter
+    :param filter_pairs: List of (filter, method) tuples
+    :param and_: All filters must pass (and instead of or)
+    """
+
+    for filter, method in filter_pairs:
+        filter_match = method(item, filter)
+
+        if not filter_match and and_:
+            return False
+        elif filter_match and not and_:
+            return True
+    
+    return and_
+
+def filter_items(items, basic_filters=None, regex_filters=None,
+        python_filters=None, not_=False, and_=False):
+    """
+    Filter items
+
+    :param items: Items to filter
+    :param basic_filters: Basic/rudimentary filters
+    :param regex_filters: Regex filters
+    :param python_filters: Python filters
+    :param not_: Invert results
+    :param and_: All filters must pass (and instead of or)
+    """
+
+    filter_pairs = []
+
+    if basic_filters:
+        for filter in basic_filters:
+            filter_pairs.append((filter, run_basic_filter))
+
+    if python_filters:
+        for filter in python_filters:
+            filter_pairs.append((filter, run_python_filter))
+
+    if regex_filters:
+        for filter in regex_filters:
+            filter_pairs.append((filter, run_regex_filter))
+
+    for item in items:
+        match = run_filters(item, filter_pairs, and_)
+
+        # invert all the filters?
+        if not_:
+            match = not match
+
+        if match:
+            yield item
 
 def main():
-    type_alias_info = ', '.join(['{}={}'.format(short, full) for short, full in type_aliases.items()])
-    object_alias_info = ', '.join(['{}={}'.format(short, full) for short, full in class_aliases.items()])
+    # info for argparse help
+    category_alias_info = ', '.join(['{}={}'.format(short, full) for short, full in category_aliases.items()])
+    quick_filter_info = ', '.join(quick_filters.keys())
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('-n', '--not', action='store_true', dest='not_', help='Invert the filters')
-    parser.add_argument('-p', '--property', action='append', help='Select property')
-    parser.add_argument('-s', '--sort', help='Sort by field')
-    parser.add_argument('-t', '--type', action='append', help='Select objects by samaccounttype. Case-insensitive and accepts aliases '.format(type_alias_info))
-    parser.add_argument('-c', '--object-class', action='append', help='Select objects of class. May be case-insensitive AD class names or aliases {}'.format(object_alias_info))
-    parser.add_argument('--parent-class', action='append', help='Select objects in class, including parent classes. May be case-insensitive AD class names or aliases (see --object-class)')
-    parser.add_argument('-f', '--filter', action='append', help='Filter by property (property=value)')
-    parser.add_argument('-F', '--filter-file', help='Filter by properties in file (property=value)')
-    parser.add_argument('-r', '--regex', action='append', help='Filter by property (property=regex)')
-    parser.add_argument('-H', '--no-headers', action='store_true', help="Don't show headers")
-    parser.add_argument('--emails', action='store_true', help="Produce a list of emails (for Get-DomainUser)")
-    parser.add_argument('--tree', action='store_true', help="Produce a tree (for Get-DomainGroup)")
-    parser.add_argument('--admins', action='store_true', help="Only show admins (admincount=1)")
-    parser.add_argument('--laps', action='store_true', help="Show computers with LAPS enabled")
-    parser.add_argument('files', nargs='+', help='Files to parse')
+    group = parser.add_argument_group('parsing')
+    group.add_argument('--no-generator', action='store_true',
+            help='Do not use generator-producing lazy-loading JSON performance hack that works most of the time but not always')
+
+    group = parser.add_argument_group('filters')
+    group.add_argument('-f', '--filter', action='append',
+            help='Filter by property (property=value)')
+    group.add_argument('-F', '--filter-file',
+            help='Filter by properties in file (property=value)')
+    group.add_argument('-r', '--regex', action='append',
+            help='Filter by property (property=regex)')
+    group.add_argument('-P', '--python-filter', action='append',
+            help='Filter with an evaled Python boolean expression. Each run exposes "item" which is {key: value, ...}')
+    group.add_argument('-n', '--not', action='store_true', dest='not_',
+            help='Invert the filters')
+    group.add_argument('-a', '--and', action='store_true', dest='and_',
+            help='Treat filters as an "and" instead of an "or". Narrow search down for search filter applied.')
+    group.add_argument('-c', '--category', action='append',
+            help='Filter objects by x-baseCategory. Aliases: {}'.format(category_aliases))
+    group.add_argument('-q', '--quick-filter', action='append', choices=quick_filters.keys(),
+            help="Add a quick filter. Options: {}".format(quick_filter_info))
+
+    group = parser.add_argument_group('regular output')
+    group.add_argument('-p', '--property', action='append',
+            help='Select property to show')
+    group.add_argument('-s', '--sort',
+            help='Sort by field')
+    group.add_argument('--pretty-print', action='store_true',
+            help="Show pretty human-readable headers")
+    group.add_argument('--no-keys', action='store_true',
+            help="Do not show parameter keys")
+    group.add_argument('--show-binary', action='store_true',
+            help="Show binary blobs in their encoded formats")
+    group.add_argument('-D', '--debug', action='store_true',
+            help="Enable debug output")
+
+    group = parser.add_argument_group('special output')
+    group.add_argument('--emails', action='store_true',
+            help="Produce a list of user emails")
+    group.add_argument('--tree', action='store_true',
+            help="Produce a user-group tree (for Get-DomainGroup)")
+    group.add_argument('--count', action='store_true',
+            help="Produce tally of items")
+    group.add_argument('--wordlist', action='store_true',
+            help="Produce a wordlist from field values")
+    group.add_argument('files', nargs='+',
+            help='Files to parse')
     args = parser.parse_args()
 
-    # read in files
-    for file_ in args.files:
-        with open(file_, 'r') as fp:
-            data = fp.read()
-            items = parse_powerview(data)
+    # -D/--debug
+    if args.debug:
+        utils.enable_debug()
 
-            #contents = fp.read().decode('utf-16').encode('utf-8').decode()
-            #lines = contents.decode().splitlines()
+    # read in files
+    items = read_files(args.files, generator=not args.no_generator)
+
+    basic_filters = []
+    python_filters = []
+    regex_filters = []
+
+    # deal with filters
+    # -P/--python-filter
+    if args.python_filter:
+        python_filters += args.python_filter
 
     # -f/--filter
-    filters = []
     if args.filter:
-        filters += args.filter
+        basic_filters += args.filter
 
     # -F/--filter-file
     if args.filter_file:
         with open(args.filter_file, 'r') as fp:
-            filters += list(fp.readlines())
+            basic_filters += list(fp.readlines())
 
-    # quick filters
-    # --admins
-    if args.admins:
-        filters.append('admincount=1')
+    # -r/--regex
+    if args.regex:
+        regex_filters += args.regex
 
-    # --laps
-    if args.laps:
-        filters.append('ms-mcs-admpwdexpirationtime=*')
+    # -q/--quick-filter
+    if args.quick_filter:
+        for name in args.quick_filter:
+            python_filters.append(quick_filters[name])
 
-    # -t/--type
-    if args.type:
-        for account_type in args.type:
-            account_type = convert_samaccounttype_aliases(account_type)
-            filters.append('samaccounttype={}'.format(account_type))
+    # -c/--category
+    if args.category:
+        for category in args.category:
+            category = convert_category_aliases(category)
+            basic_filters.append('x-baseCategory={}'.format(category))
+
+    # fix items
+    items = fix_items(items, remove_binary=not args.show_binary)
 
     # filter items
-    filtered_items = []
-    for item in items:
-        filtered_item = filters or args.regex or \
-                        args.object_class or args.parent_class
-
-        # check filters
-        for filt in filters:
-            if '=' not in filt:
-                raise RuntimeError('Bad filter: ' + filt)
-            
-            key, *value_parts = filt.split('=')
-            value = '='.join(value_parts)
-            key = key.strip().lower()
-            value = value.strip().lower()
-
-            if not key or key == '*':
-                # all keys
-                keys = item.keys()
-            else:
-                # one key
-                if key not in item:
-                    continue
-                keys = [key]
-
-            for key in keys:
-                if not value or value == '*' or item[key].lower() == value:
-                    filtered_item = False
-                    break
-
-        # -r/--regex
-        if args.regex:
-            for filt in args.regex:
-                if '=' not in filt:
-                    raise RuntimeError('bad filter: ' + filt)
-                
-                key, *value_parts = filt.split('=')
-                value = '='.join(value_parts)
-                key = key.strip().lower()
-                value = value.strip().lower()
-
-                if not key or key == '*':
-                    # all keys
-                    keys = item.keys()
-                else:
-                    # one key
-                    if key not in item:
-                        continue
-                    keys = [key]
-
-                for key in keys:
-                    match = re.match(value, item[key], re.IGNORECASE)
-                    if match:
-                        filtered_item = False
-                        break
-
-        if (args.object_class or args.parent_class) and 'objectclass' in item:
-            object_classes = parse_enumeration(item['objectclass'])
-            in_class = False
-
-            # -c/--object-class
-            if args.object_class and object_classes:
-                for object_class in args.object_class:
-                    object_class = convert_objectclass_aliases(object_class)
-                    if object_class.lower() == object_classes[-1].lower():
-                        in_class = True
-                        break
-
-            # --parent-class
-            if args.parent_class:
-                for object_class in args.parent_class:
-                    object_class = convert_objectclass_aliases(object_class)
-                    if object_class.lower() in [object_class.lower() for object_class in object_classes]:
-                        in_class = True
-                        break
-
-            if in_class:
-                filtered_item = False
-
-        # --not
-        if args.not_:
-            filtered_item = not filtered_item
-
-        if not filtered_item:
-            filtered_items.append(item)
+    if basic_filters or args.regex or python_filters:
+        items = filter_items(items, basic_filters=basic_filters, regex_filters=regex_filters,
+                python_filters=python_filters, not_=args.not_, and_=args.and_)
 
     # -s/--sort
     if args.sort:
         all_int = True
-        for item in filtered_items:
+        for item in items:
             if args.sort in item:
                 if not utils.is_int(item[args.sort]):
                     all_int = False
@@ -326,26 +654,26 @@ def main():
                 else:
                     return ''
 
-        filtered_items = sorted(filtered_items, key=sort_helper, reverse=True)
+        items = sorted(items, key=sort_helper, reverse=True)
 
+    # output options
     # --tree
     if args.tree:
         # print tree view
-        for item in filtered_items:
-            if 'objectclass' not in item:
+        # we need to iterate over items multiple times
+        items = list(items)
+        for item in items:
+            if item['x-baseCategory'].lower() != 'group':
                 continue
 
-            if 'group' not in parse_enumeration(item['objectclass']):
-                continue
-
-            if 'memberof' not in item:
+            if 'memberOf' not in item:
                 # root item
-                print_group_tree(item, filtered_items)
+                print_group_tree(item, items)
     # --emails
     elif args.emails:
         # print email view
-        for item in filtered_items:
-            if not check_samaccounttype(item, 'user'):
+        for item in items:
+            if item['x-baseCategory'].lower() != 'person':
                 continue
 
             if 'mail' not in item:
@@ -357,53 +685,123 @@ def main():
                 name = item['mail']
 
             print('{} <{}>'.format(name, item['mail']))
+    # --count
+    elif args.count:
+        total = 0
+        counts = collections.defaultdict(int)
+        for item in items:
+            total += 1
+            counts[item['x-baseCategory']] += 1
+
+        for category in sorted(counts, key=lambda key: counts[key]):
+            count = counts[category]
+            print('{}: {}'.format(category, count))
+
+        print()
+        print('Total: {}'.format(total))
+    # --wordlist
+    elif args.wordlist:
+        words = []
+
+        def get_values(collection):
+            for value in collection:
+                if isinstance(value, str):
+                    value = value.strip()
+
+                    if value.startswith('{') and value.endswith('}'):
+                        # skip UID
+                        continue
+                    elif value.startswith('S-'):
+                        # skip SID
+                        continue
+
+                    yield value
+                elif utils.is_iterable(value):
+                    yield from get_values(value)
+        
+        for item in items:
+            for value in get_values(item.values()):
+                # split values (one split each)
+                #for split in wordlist_splits:
+                #    words += value.split(split)
+
+                # split values (one split each)
+                #split_values = [value]
+                #for split in wordlist_splits:
+                #    split_values += [v2 for v2 in [v.split(split) for v in split_values][0]]
+
+                # split words
+                split_values = [value]
+                for split in wordlist_splits:
+                    new_split_values = []
+                    for split_value in split_values:
+                        new_split_values += split_value.split(split)
+                    split_values = new_split_values
+                words += split_values
+
+        # cleanup pass
+        new_words = []
+        for word in words:
+            word = word.lower()
+            if utils.is_int(word):
+                continue
+            new_words.append(word)
+        words = new_words
+
+        # sort and group by occurence
+        words.sort()
+        words.sort(key=collections.Counter(words).get, reverse=True)
+        for word in utils.remove_grouped_duplicates(words):
+            if len(word) < wordlist_minimum_word_length:
+                # skip short words
+                continue
+            if len(word) > wordlist_maximum_word_length:
+                # skip long words
+                continue
+
+            print(word)
     else:
-        for item in filtered_items:
+        for number, item in enumerate(items):
             # print default property view
             # -p/--property
             if args.property:
                 properties = []
                 for prop in args.property:
-                    properties += prop.split(',')
+                    properties += [p.lower() for p in prop.split(',')]
 
-                if properties & item.keys() == set():
+                if set(properties) & set((key.lower() for key in item.keys())) == set():
                     # skip objects without any properties we care about
                     continue
             else:
                 properties = item.keys()
 
-            # -H/--no-headers
-            if not args.no_headers:
-                if 'samaccounttype' in item:
-                    if check_samaccounttype(item, 'user'):
-                        print('User:')
-                    elif check_samaccounttype(item, 'group'):
-                        print('Group:')
-                    elif check_samaccounttype(item, 'computer'):
-                        print('Computer:')
-                    elif check_samaccounttype(item, 'alias'):
-                        print('Alias:')
-                    else:
-                        print('Object:')
-                else:
-                    print('Object:')
+            # --pretty-print
+            if args.pretty_print:
+                print('{}:'.format(item['x-baseCategory']))
 
             # print fields
             for prop in sorted(properties):
                 if prop in item:
-                    if prop == 'usercertificate':
-                        # don't print this one
-                        value = '<bytes>'
-                    else:
-                        value = item[prop]
+                    value = item[prop]
 
-                    if args.no_headers:
-                        print('{}'.format(value))
+                    indent = ' ' * 4
+                    if args.no_keys:
+                        if args.pretty_print:
+                            print(indent + '- {}'.format(value))
+                        else:
+                            print('{}'.format(value))
                     else:
-                        print('  - {}: {}'.format(prop, value))
+                        if args.pretty_print:
+                            if isinstance(value, list):
+                                print(indent + '- {}:'.format(prop))
+                                for piece in value:
+                                    print(indent * 2 + '- {}'.format(piece))
+                            else:
+                                print(indent + '- {}: {}'.format(prop, value))
+                        else:
+                            print('{}: {}'.format(prop, value))
 
-            if not args.no_headers:
-                print('')
+            print()
 
 if __name__ == '__main__':
     main()
