@@ -3,6 +3,17 @@ DumpLDAP
 
 DumpLDAP dumps an LDAP server to json. This allows for offline exploration and better network opsec. Usage:
 
+    $ ./DumpLDAP -u CORP/DA_david -p P@ssw0rd 10.51.5.3 -o dump.json
+    [.] connecting to server
+        - host: 10.51.5.3
+    [.] authenticating
+        - user: CORP\DA_david
+        - password: P@ssw0rd
+        - auth type: NTLM
+	...
+
+Full options:
+
     usage: DumpLDAP [-h] -u USER -p PASSWORD [--simple-auth] [-q QUERY] [-b BASE]
                     [--page-size PAGE_SIZE] [--page-throttle PAGE_THROTTLE]
                     [--no-pagination] [-o OUTPUT]
@@ -39,7 +50,7 @@ ldapdomaindump, and PowerView's with `Get-Domain*` functions ( e.g.
 
 Searching for Windows 7 machines:
 
-    $ ./ParseDomain --regex 'operatingsystem=.*windows 7.*' --property name --property operatingsystem --no-headers output.txt
+    $ ./ParseDomain --regex 'operatingsystem=.*windows 7.*' --property name --property operatingsystem --no-headers dump.json
     Item:
       - name: CORP339
       - operatingsystem: Windows 7 Enterprise
@@ -54,7 +65,7 @@ Searching for Windows 7 machines:
 
 Searching for domain controllers:
 
-    $ ./ParseDomain --regex 'distinguishedname=.*OU=Domain Controllers.*' --property name --property operatingsystem output.txt
+    $ ./ParseDomain --regex 'distinguishedname=.*OU=Domain Controllers.*' --property name --property operatingsystem dump.json
     Item:
       - name: DC2
       - operatingsystem: Windows Server 2012 R2 Datacenter
