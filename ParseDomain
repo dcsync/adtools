@@ -77,7 +77,7 @@ property_aliases = {'dn': 'distinguishedName',
 quick_filters = {'laps': '"ms-mcs-admpwdexpirationtime" in item',
                  'admin': 'item["admincount"] == 1',
                  'dc': 'item["x-baseCategory"] == "Computer" and "OU=Domain Controllers" in item["distinguishedname"]',
-                 'da': '"CN=Domain Admins," in "".join(item["memberOf"])',
+                 'da': '"CN=Domain Admins," in str(item["memberOf"])',
                  'server': 'item["x-baseCategory"] == "Computer" and "Server" in item["operatingSystem"]',
                 }
 
@@ -117,36 +117,6 @@ boring_user_fields = (
     'whenCreated'
 )
 
-def convert_class_aliases(class_):
-    """
-    Convert short-form objectclass names to their full versions
-
-    :param class_: Possibly short-form object class
-    :return: Full-form object class
-    """
-
-    global class_aliases
-
-    if class_.lower() in class_aliases:
-        return class_aliases[class_.lower()]
-    else:
-        return class_
-
-def convert_category_aliases(category):
-    """
-    Convert short-form objectCategory and x-baseCategory names to their full versions
-
-    :param category: Possibly short-form object category
-    :return: Full-form object category
-    """
-
-    global category_aliases
-
-    if category.lower() in category_aliases:
-        return category_aliases[category.lower()]
-    else:
-        return category
-
 def parse_powershell_enumeration(enumeration, allow_incomplete=True):
     """
     Parse a PowerShell enumeration in the '{item1, item2}' format.
@@ -174,6 +144,18 @@ def parse_powershell_enumeration(enumeration, allow_incomplete=True):
     else:
         # single item
         return [enumeration]
+
+def dn_to_fqdn(dn):
+    return '.'.join(parse_dn(dn))
+
+def parse_dn(dn):
+    ret = []
+    parts = dn.split(',')
+    for part in parts:
+        if part[0:3] not in ('CN=', 'DC=', 'OU='):
+            raise RuntimeError('not a DN: {}'.format(dn))
+        ret.append(part[3:])
+    return ret
 
 def find_item(dn, items):
     """
@@ -373,6 +355,13 @@ def fix_items(items, remove_binary=True):
     """
 
     for item in items:
+        if not item:
+            continue
+
+        if 'objectCategory' not in item:
+            utils.bad('item missing objectCategory: {}'.format(str(item)), status=True)
+            continue
+
         new_item = utils.CaselessDictionary()
         for key, value in item.items():
             # flatten top level single-item lists
@@ -382,10 +371,21 @@ def fix_items(items, remove_binary=True):
             value = fix_value(value, remove_binary=remove_binary)
             new_item[key] = value
 
-        # add basecategory
+        # add x-baseCategory
         categories = item_categories(new_item)
         #new_item['x-categories'] = categories
         new_item['x-baseCategory'] = categories[0]
+
+        # add x-groups
+        if 'memberOf' in item:
+            if isinstance(item['memberOf'], str):
+                groups = [item['memberOf']]
+            else:
+                groups = item['memberOf']
+        else:
+            groups = []
+        #new_item['x-groups'] = [dn_to_fqdn(group) for group in groups]
+
         yield new_item
 
 def run_python_filter(item, filter):
@@ -621,7 +621,7 @@ def main():
     # -c/--category
     if args.category:
         for category in args.category:
-            category = convert_category_aliases(category)
+            category = utils.alias(category, category_aliases, lower=True)
             basic_filters.append('x-baseCategory={}'.format(category))
 
     # fix items
@@ -768,6 +768,8 @@ def main():
                 properties = []
                 for prop in args.property:
                     properties += [p.lower() for p in prop.split(',')]
+
+                properties = list(map(lambda p: utils.alias(p, property_aliases, lower=True), properties))
 
                 if set(properties) & set((key.lower() for key in item.keys())) == set():
                     # skip objects without any properties we care about
