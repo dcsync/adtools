@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 
 import sys
-import os
-import re
 import argparse
 import ldap3
-import pprint
-import asyncio
-import json
+import time
 
 import utils
 
 default_page_size = 100
 default_page_throttle = 0.0
 default_query = '(&(objectclass=*))'
+default_port=389
+
+auth_types = ['simple', 'ntlm', 'sasl', 'anonymous']
 
 #27  from ...utils.dn import safe_dn
 #  1 from ...core.results import DO_NOT_RAISE_EXCEPTIONS, RESULT_SIZE_LIMIT_EXCEEDED
@@ -103,7 +102,7 @@ def paged_search_generator(connection,
     connection.auto_referrals = original_auto_referrals
     connection.response = None
 
-async def dumpEntries(out, entries):
+def dumpEntries(out, entries):
     """
     Dump entries from an LDAP query to a file as JSON
 
@@ -118,12 +117,12 @@ async def dumpEntries(out, entries):
         outfp = sys.stdout
 
     outfp.write('[\n')
-    async for entry in entries:
+    for entry in entries:
         # dictionary: entry_attributes_as_dict
         outfp.write(entry.entry_to_json() + ',\n')
     outfp.write(']\n')
 
-async def makeQuery(connection, base, query,
+def makeQuery(connection, base, query,
         pagination=True, page_throttle=default_page_throttle,
         page_size=default_page_size):
     """
@@ -154,37 +153,53 @@ async def makeQuery(connection, base, query,
             yield entry
             if page_throttle != 0.0 and number % (page_size - 1) == 0 and number != 0:
                 # page request throttle
-                await asyncio.sleep(page_throttle)
+                #await asyncio.sleep(page_throttle)
+                time.sleep(page_throttle)
     else:
         connection.search(base, query, attributes=ldap3.ALL_ATTRIBUTES)
         for entry in connection.response:
             yield entry
 
-def connect(host, user, password, simple_auth=False):
+def connect(host, user, password, port=139, ssl=False, auth=None):
     """
     Connect to an LDAP server
 
     :param host: Server host
     :param user: Auth username
     :param password: Auth password
-    :param simple_auth: User SIMPLE auth instead of NTLM auth
+    :param ssl: Use SSL
+    :param auth: Authentication type (see auth_types)
     """
 
     # fix / in username
-    if '/' in user:
+    if user and '/' in user:
         user = user.replace('/', '\\')
 
-    server = ldap3.Server(host, get_info=ldap3.ALL) 
+    # set default auth
+    if auth is None:
+        if user is None:
+            # no user? anonymous
+            auth = 'anonymous'
+        else:
+            # user? not anonymous
+            auth = 'NTLM'
+
+    # check auth
+    auth = auth.lower()
+    if auth not in auth_types:
+        utils.die('auth must be one of: {}'.format(', '.join(auth_types)))
+
+    server = ldap3.Server(host, use_ssl=ssl, port=port, get_info=ldap3.ALL) 
     utils.info('connecting to server')
     utils.subline('- host: {}'.format(host))
 
-    authentication = 'SIMPLE' if simple_auth else 'NTLM' 
-    connection = ldap3.Connection(server, user=user, password=password, authentication=authentication)
+    connection = ldap3.Connection(server, user=user, password=password, authentication=auth if auth != 'anonymous' else None)
 
     utils.info('authenticating')
-    utils.subline('- user: {}'.format(user))
-    utils.subline('- password: {}'.format(password))
-    utils.subline('- auth type: {}'.format(authentication))
+    utils.subline('- auth type: {}'.format(auth))
+    if auth != 'anonymous':
+        utils.subline('- user: {}'.format(user))
+        utils.subline('- password: {}'.format(password))
     if not connection.bind():
         utils.die('failed to authenticate as {}'.format(user))
 
@@ -193,14 +208,19 @@ def connect(host, user, password, simple_auth=False):
 def main():
     parser = argparse.ArgumentParser()
     group = parser.add_argument_group('auth')
-    group.add_argument('-u', '--user', required=True,
+    group.add_argument('-u', '--user',
             help='Auth username (DOMAIN\\user)')
-    group.add_argument('-p', '--password', required=True,
+    group.add_argument('-p', '--password',
             help='Auth password or LM:NTLM hash')
-    group.add_argument('--simple-auth', action='store_true',
-            help='Use SIMPLE auth instead of NTLM')
+    group.add_argument('--auth', choices=auth_types,
+            help='Authentication type (default: Anonymous or NTLM)')
     group = parser.add_argument_group('ldap')
+
     group.add_argument('host', help='LDAP server')
+    group.add_argument('--port', default=default_port, type=int,
+            help='Server port (default: {})'.format(default_port))
+    group.add_argument('--ssl', action='store_true',
+            help='Connect with SSL/TLS (LDAPS)')
     group.add_argument('-q', '--query', default=default_query,
             help='LDAP query (default: dump everything with {})'.format(default_query))
     group.add_argument('-b', '--base',
@@ -217,10 +237,11 @@ def main():
     args = parser.parse_args()
 
     # check user
-    if not ('\\' in args.user or '/' in args.user):
+    if args.user and not ('\\' in args.user or '/' in args.user):
         utils.die('User must be in the format DOMAIN\\user')
 
-    server, connection = connect(args.host, args.user, args.password, simple_auth=args.simple_auth)
+    server, connection = connect(args.host, args.user, args.password,
+        port=args.port, ssl=args.ssl, auth=args.auth)
 
     # choose base
     if args.base:
@@ -245,8 +266,10 @@ def main():
     # make query
     entries = makeQuery(connection, base, args.query, pagination=not args.no_pagination,
             page_throttle=args.page_throttle, page_size=args.page_size)
-    loop = asyncio.get_event_loop()
-    result = loop.run_until_complete(dumpEntries(args.output, entries))
+
+    #loop = asyncio.get_event_loop()
+    #result = loop.run_until_complete(dumpEntries(args.output, entries))
+    dumpEntries(args.output, entries)
 
 if __name__ == '__main__':
     main()

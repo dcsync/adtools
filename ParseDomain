@@ -53,7 +53,7 @@ tree_indent = 4
 # wordlist settings
 wordlist_minimum_word_length = 3
 wordlist_maximum_word_length = 10
-wordlist_splits = (None, '/', '=', '.', ',', ';', ':', '-', '@', '#', '$', '&', '\\', '+')
+wordlist_splits = (None, '/', '=', '.', ',', ';', ':', '-', '@', '#', '$', '&', '\\', '+', '?', '{', '}', '*')
 
 # category and objectclass aliases
 class_aliases = {'gpo': 'groupPolicyContainer',
@@ -71,8 +71,8 @@ category_aliases = {'gpo': 'Group-Policy-Container',
                     'g': 'Group',
                     'c': 'Computer'}
 
-property_aliases = {'dn': 'distinguishedName',
-                    'spn': 'servicePrincipalName'}
+property_aliases = {'dn': 'distinguishedname',
+                    'spn': 'serviceprincipalname'}
 
 quick_filters = {'laps': '"ms-mcs-admpwdexpirationtime" in item',
                  'admin': 'item["admincount"] == 1',
@@ -529,6 +529,11 @@ def filter_items(items, basic_filters=None, regex_filters=None,
         if match:
             yield item
 
+
+def print_spns():
+    pass
+
+
 def main():
     # info for argparse help
     category_alias_info = ', '.join(['{}={}'.format(short, full) for short, full in category_aliases.items()])
@@ -572,6 +577,8 @@ def main():
             help="Enable debug output")
 
     group = parser.add_argument_group('special output')
+    group.add_argument('--spns', action='store_true',
+            help="Print SPNs")
     group.add_argument('--emails', action='store_true',
             help="Produce a list of user emails")
     group.add_argument('--tree', action='store_true',
