@@ -179,21 +179,22 @@ def connect(host, user, password, port=139, ssl=False, auth=None):
     if auth is None:
         if user is None:
             # no user? anonymous
-            auth = 'anonymous'
+            auth = 'ANONYMOUS'
         else:
             # user? not anonymous
             auth = 'NTLM'
 
     # check auth
-    auth = auth.lower()
-    if auth not in auth_types:
+    if auth.lower() not in auth_types:
         utils.die('auth must be one of: {}'.format(', '.join(auth_types)))
+    # the library wants it to be uppercase though
+    auth = auth.upper()
 
     server = ldap3.Server(host, use_ssl=ssl, port=port, get_info=ldap3.ALL) 
     utils.info('connecting to server')
     utils.subline('- host: {}'.format(host))
 
-    connection = ldap3.Connection(server, user=user, password=password, authentication=auth if auth != 'anonymous' else None)
+    connection = ldap3.Connection(server, user=user, password=password, authentication=auth)
 
     utils.info('authenticating')
     utils.subline('- auth type: {}'.format(auth))

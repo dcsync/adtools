@@ -175,7 +175,7 @@ def find_item(dn, items):
 
     return None
 
-def print_group_tree(root, items, level=0):
+def print_group_tree(root, items, emails=False, full=False, level=0):
     """
     Print a tree by linking member fields with their items recursively
 
@@ -186,7 +186,18 @@ def print_group_tree(root, items, level=0):
 
     global tree_indent
 
-    print(' ' * (level * tree_indent) + root['name'])
+    # non-full tree only shows groups and persons
+    if not full and root['x-baseCategory'].lower() not in ['group', 'person']:
+        return
+
+    content = root['name']
+    if emails and 'mail' in root:
+        content += ' <{}>'.format(root['mail'])
+    if full:
+        content = root['x-baseCategory'] + ': ' + content
+
+    print(' ' * (level * tree_indent) + content)
+
     if 'member' in root:
         members = root['member']
         if not isinstance(members, list):
@@ -199,7 +210,7 @@ def print_group_tree(root, items, level=0):
                 if found['distinguishedname'].lower() == root['distinguishedname'].lower():
                     continue
 
-                print_group_tree(found, items, level=level + 1)
+                print_group_tree(found, items, emails=emails, full=full, level=level + 1)
             else:
                 print(' ' * ((level + 1) * tree_indent) + 'missing item: ' + member)
 
@@ -581,8 +592,12 @@ def main():
             help="Print SPNs")
     group.add_argument('--emails', action='store_true',
             help="Produce a list of user emails")
-    group.add_argument('--tree', action='store_true',
+    group.add_argument('--group-tree', action='store_true',
             help="Produce a user-group tree (for Get-DomainGroup)")
+    group.add_argument('--full-tree', action='store_true',
+            help="Show all objects in tree (instead of just people)")
+    group.add_argument('--tree-emails', action='store_true',
+            help="Show emails in tree")
     group.add_argument('--count', action='store_true',
             help="Produce tally of items")
     group.add_argument('--wordlist', action='store_true',
@@ -664,18 +679,15 @@ def main():
         items = sorted(items, key=sort_helper, reverse=True)
 
     # output options
-    # --tree
-    if args.tree:
+    # --group-tree and --full-tree
+    if args.group_tree or args.full_tree:
         # print tree view
         # we need to iterate over items multiple times
         items = list(items)
         for item in items:
-            if item['x-baseCategory'].lower() != 'group':
-                continue
-
             if 'memberOf' not in item:
                 # root item
-                print_group_tree(item, items)
+                print_group_tree(item, items, emails=args.tree_emails, full=args.full_tree)
     # --emails
     elif args.emails:
         # print email view
